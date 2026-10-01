@@ -330,14 +330,36 @@ function modelLabel(model: { provider: string; id: string }): string {
 
 async function parentPid(pid: string): Promise<string> {
   const result = await runCommandAsync("ps", ["-o", "ppid=", "-p", pid]);
-  if (result.status !== 0) return "";
-  return result.stdout.trim();
+  if (result.status === 0 && result.stdout.trim()) return result.stdout.trim();
+  if (process.platform === "win32") {
+    const pw = spawnSync("powershell.exe", ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").ParentProcessId`], { encoding: "utf8" });
+    if (pw.status === 0 && pw.stdout.trim()) return pw.stdout.trim();
+  }
+  return "";
 }
 
 function parentPidSync(pid: string): string {
   const result = spawnSync("ps", ["-o", "ppid=", "-p", pid], { encoding: "utf8" });
-  if (result.status !== 0) return "";
-  return result.stdout.trim();
+  if (result.status === 0 && result.stdout.trim()) return result.stdout.trim();
+  if (process.platform === "win32") {
+    const pw = spawnSync("powershell.exe", ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").ParentProcessId`], { encoding: "utf8" });
+    if (pw.status === 0 && pw.stdout.trim()) return pw.stdout.trim();
+  }
+  return "";
+}
+
+function msysToWinpid(msysPid: string): string | null {
+  if (process.platform !== "win32") return null;
+  const res = spawnSync("ps", ["-W"], { encoding: "utf8" });
+  if (res.status === 0 && res.stdout) {
+    for (const line of res.stdout.split(/\r?\n/)) {
+      const parts = line.trim().split(/\s+/);
+      if (parts[0] === String(msysPid) && parts[3]) {
+        return parts[3];
+      }
+    }
+  }
+  return null;
 }
 
 function pidAlive(pid: string): boolean {
@@ -345,6 +367,15 @@ function pidAlive(pid: string): boolean {
     process.kill(Number(pid), 0);
     return true;
   } catch {
+    if (process.platform === "win32") {
+      const res = spawnSync("tasklist.exe", ["/FI", `PID eq ${pid}`, "/NH"], { encoding: "utf8" });
+      if (res.status === 0 && res.stdout) {
+        for (const line of res.stdout.split(/\r?\n/)) {
+          const parts = line.trim().split(/\s+/);
+          if (parts.length >= 2 && parts[1] === String(pid)) return true;
+        }
+      }
+    }
     return false;
   }
 }
@@ -390,9 +421,10 @@ function ownershipVerdict(lockPid: string, ancestryMatched: boolean): LockOwners
 async function lockOwnership(): Promise<LockOwnership> {
   const { lockPid, verdict } = readLockPid();
   if (verdict) return verdict;
+  const targetWinpid = msysToWinpid(lockPid) || lockPid;
   let pid = String(process.pid);
   for (let i = 0; i < LOCK_ANCESTRY_DEPTH; i += 1) {
-    if (pid === lockPid) {
+    if (pid === lockPid || pid === targetWinpid) {
       const current = readLockPid();
       if (current.verdict || current.lockPid !== lockPid) return current.verdict ?? "other";
       return ownershipVerdict(lockPid, true);
@@ -411,9 +443,10 @@ async function lockOwnership(): Promise<LockOwnership> {
 function lockOwnershipSync(): LockOwnership {
   const { lockPid, verdict } = readLockPid();
   if (verdict) return verdict;
+  const targetWinpid = msysToWinpid(lockPid) || lockPid;
   let pid = String(process.pid);
   for (let i = 0; i < LOCK_ANCESTRY_DEPTH; i += 1) {
-    if (pid === lockPid) return ownershipVerdict(lockPid, true);
+    if (pid === lockPid || pid === targetWinpid) return ownershipVerdict(lockPid, true);
     pid = parentPidSync(pid);
     if (!pid || pid === "1") break;
   }

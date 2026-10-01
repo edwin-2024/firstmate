@@ -81,7 +81,7 @@ fm_harness_process_matches() {  # <comm> <args>
   # Bare interpreter (e.g. node): match the harness name in its script path.
   case "$comm" in
     *node*|*python*)
-      if printf '%s' "$args" | grep -qE "$FM_HARNESS_RE"; then
+      if printf '%s' "$args" | grep -qE "$FM_HARNESS_RE" || printf '%s' "$args" | grep -qE 'pi-coding-agent|/\.?pi/|\\\.?pi\\'; then
         case "$args" in *claude*) FM_HARNESS_IS_CLAUDE=1 ;; esac
         return 0
       fi
@@ -112,12 +112,76 @@ fm_harness_process_matches() {  # <comm> <args>
 # worker chain (hook shell -> claude bg-spare -> claude bg-pty-host -> claude ->
 # claude), with no non-harness process between them. Which pid in that run is the
 # session cannot be read off the ancestry at all, so the whole contiguous run is
+_fm_winpid_alive() {
+  local pid=$1
+  case "${_FM_UNAME:-$(uname -s 2>/dev/null)}" in
+    MINGW*|MSYS*|CYGWIN*)
+      if command -v tasklist.exe >/dev/null 2>&1; then
+        tasklist.exe //FI "PID eq $pid" //NH 2>/dev/null | grep -qE "^[a-zA-Z0-9_.-]+\.exe\s+$pid" && return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
+_fm_process_comm_args() {  # <pid> -> outputs comm\nargs
+  local pid=$1 comm args
+  if comm=$(ps -o comm= -p "$pid" 2>/dev/null); then
+    args=$(ps -o args= -p "$pid" 2>/dev/null)
+    printf '%s\n%s\n' "$comm" "$args"
+    return 0
+  fi
+  if [ ! -r "/proc/$pid/cmdline" ]; then
+    local msys_p
+    msys_p=$(grep -lx "$pid" /proc/[0-9]*/winpid 2>/dev/null | head -n 1)
+    if [ -n "$msys_p" ]; then
+      pid=${msys_p%/winpid}
+      pid=${pid#/proc/}
+    fi
+  fi
+  if [ -r "/proc/$pid/cmdline" ]; then
+    args=$(cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' ' ')
+    comm=$(awk '{print $2}' "/proc/$pid/stat" 2>/dev/null | tr -d '()')
+    [ -n "$comm" ] || comm=${args%% *}
+    printf '%s\n%s\n' "$comm" "$args"
+    return 0
+  fi
+  if command -v powershell.exe >/dev/null 2>&1; then
+    local pw_out
+    pw_out=$(powershell.exe -NoProfile -Command "
+\$p = Get-CimInstance Win32_Process -Filter \"ProcessId = $pid\"
+if (\$p) {
+  Write-Host \$p.Name
+  Write-Host \$p.CommandLine
+}
+" 2>/dev/null)
+    if [ -n "$pw_out" ]; then
+      printf '%s\n' "$pw_out"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+_fm_process_ppid() {  # <pid> -> outputs ppid
+  local pid=$1 ppid
+  if ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' '); then
+    [ -n "$ppid" ] && { printf '%s\n' "$ppid"; return 0; }
+  fi
+  if [ -r "/proc/$pid/stat" ]; then
+    ppid=$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null)
+    [ -n "$ppid" ] && { printf '%s\n' "$ppid"; return 0; }
+  fi
+  return 1
+}
+
 # reported and the callers below decide what they need from it.
 fm_harness_ancestry_pids() {
-  local pid=$$ comm args extending=0 printed=0
+  local pid=$$ comm args extending=0 printed=0 comm_args
   for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
-    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || break
-    args=$(ps -o args= -p "$pid" 2>/dev/null)
+    comm_args=$(_fm_process_comm_args "$pid") || break
+    comm=$(printf '%s\n' "$comm_args" | head -n 1)
+    args=$(printf '%s\n' "$comm_args" | tail -n +2)
     if fm_harness_process_matches "$comm" "$args"; then
       printf '%s\n' "$pid"
       printed=1
@@ -126,7 +190,7 @@ fm_harness_ancestry_pids() {
     elif [ "$extending" -eq 1 ]; then
       break
     fi
-    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    pid=$(_fm_process_ppid "$pid") || break
     # Examine the top of the chain before stopping. Inside a PID namespace the
     # harness itself is pid 1, so stopping as soon as the next pid is 1 hides the
     # very process this walk exists to find. A host's real pid 1 (init, systemd,
@@ -134,6 +198,61 @@ fm_harness_ancestry_pids() {
     case "$pid" in '' | *[!0-9]*) break ;; esac
     [ "$pid" -ge 1 ] || break
   done
+  if [ "$printed" -eq 0 ] && ([ -n "${PI_SESSION_FILE:-}" ] || [ -n "${PI_SESSION_ID:-}" ]); then
+    local m marker_pid
+    for m in "${FM_STATE_OVERRIDE:-${FM_HOME:-$FM_ROOT}/state}/.pi-watch-extension-loaded" "${FM_STATE_OVERRIDE:-${FM_HOME:-$FM_ROOT}/state}/.pi-turnend-extension-loaded"; do
+      if [ -f "$m" ]; then
+        marker_pid=$(sed -n '2p' "$m" 2>/dev/null)
+        if [ -n "$marker_pid" ] && fm_harness_pid_alive "$marker_pid"; then
+          printf '%s\n' "$marker_pid"
+          printed=1
+          break
+        fi
+      fi
+    done
+    if [ "$printed" -eq 0 ] && [ -r /proc/$$/winpid ] && command -v powershell.exe >/dev/null 2>&1; then
+      local winpid_list wpid
+      winpid_list=$(WINPID_VAL=$(cat /proc/$$/winpid 2>/dev/null) powershell.exe -NoProfile -Command '
+$cur = [int]$env:WINPID_VAL
+while ($cur -and $cur -ne 0) {
+  $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $cur"
+  if ($proc) {
+    if (($proc.Name -like "*node*" -and ($proc.CommandLine -like "*pi-coding-agent*" -or $proc.CommandLine -like "*pi-launcher*")) -or $proc.Name -like "*pi*") {
+      Write-Host $proc.ProcessId
+    }
+    $cur = $proc.ParentProcessId
+  } else {
+    break
+  }
+}' 2>/dev/null)
+      for wpid in $winpid_list; do
+        if [ -n "$wpid" ] && fm_harness_pid_alive "$wpid"; then
+          printf '%s\n' "$wpid"
+          printed=1
+          break
+        fi
+      done
+    fi
+    if [ "$printed" -eq 0 ]; then
+      local want_id="${PI_SESSION_ID:-}"
+      for p in /proc/[0-9]*; do
+        local check_pid=${p#/proc/}
+        local check_cmd
+        check_cmd=$(cat "$p/cmdline" 2>/dev/null | tr '\0' ' ')
+        if [[ "$check_cmd" == *"pi-coding-agent"* ]]; then
+          local ret_pid=$check_pid
+          if [ -r "$p/winpid" ]; then
+            ret_pid=$(cat "$p/winpid" 2>/dev/null)
+          fi
+          if [ -z "$want_id" ] || [[ "$check_cmd" == *"$want_id"* ]] || fm_harness_pid_alive "$ret_pid"; then
+            printf '%s\n' "$ret_pid"
+            printed=1
+            break
+          fi
+        fi
+      done
+    fi
+  fi
   [ "$printed" -eq 1 ]
 }
 
@@ -162,10 +281,11 @@ EOF
 
 # True if $1 is a live process that looks like a verified harness.
 fm_harness_pid_alive() {
-  local pid=$1 comm args
-  kill -0 "$pid" 2>/dev/null || return 1
-  comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
-  args=$(ps -o args= -p "$pid" 2>/dev/null)
+  local pid=$1 comm args comm_args
+  { kill -0 "$pid" 2>/dev/null || { [ -x /bin/kill ] && /bin/kill -W -0 "$pid" 2>/dev/null; } || _fm_winpid_alive "$pid"; } || return 1
+  comm_args=$(_fm_process_comm_args "$pid") || return 1
+  comm=$(printf '%s\n' "$comm_args" | head -n 1)
+  args=$(printf '%s\n' "$comm_args" | tail -n +2)
   fm_harness_process_matches "$comm" "$args"
 }
 
@@ -363,7 +483,7 @@ fm_session_lock_inspect() {  # <state>
       return 0
       ;;
   esac
-  if kill -0 "$pid" 2>/dev/null; then
+  if kill -0 "$pid" 2>/dev/null || { [ -x /bin/kill ] && /bin/kill -W -0 "$pid" 2>/dev/null; } || _fm_winpid_alive "$pid"; then
     if fm_harness_pid_alive "$pid"; then
       FM_LOCK_INSPECT_STATE=held
       FM_LOCK_INSPECT_LIVE_HARNESS=true

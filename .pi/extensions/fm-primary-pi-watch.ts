@@ -215,8 +215,26 @@ function positiveInteger(name: string, fallback: number): number {
 
 function parentPid(pid: string): string {
   const result = spawnSync("ps", ["-o", "ppid=", "-p", pid], { encoding: "utf8" });
-  if (result.status !== 0) return "";
-  return result.stdout.trim();
+  if (result.status === 0 && result.stdout.trim()) return result.stdout.trim();
+  if (process.platform === "win32") {
+    const pw = spawnSync("powershell.exe", ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").ParentProcessId`], { encoding: "utf8" });
+    if (pw.status === 0 && pw.stdout.trim()) return pw.stdout.trim();
+  }
+  return "";
+}
+
+function msysToWinpid(msysPid: string): string | null {
+  if (process.platform !== "win32") return null;
+  const res = spawnSync("ps", ["-W"], { encoding: "utf8" });
+  if (res.status === 0 && res.stdout) {
+    for (const line of res.stdout.split(/\r?\n/)) {
+      const parts = line.trim().split(/\s+/);
+      if (parts[0] === String(msysPid) && parts[3]) {
+        return parts[3];
+      }
+    }
+  }
+  return null;
 }
 
 function pidAlive(pid: string): boolean {
@@ -224,6 +242,15 @@ function pidAlive(pid: string): boolean {
     process.kill(Number(pid), 0);
     return true;
   } catch {
+    if (process.platform === "win32") {
+      const res = spawnSync("tasklist.exe", ["/FI", `PID eq ${pid}`, "/NH"], { encoding: "utf8" });
+      if (res.status === 0 && res.stdout) {
+        for (const line of res.stdout.split(/\r?\n/)) {
+          const parts = line.trim().split(/\s+/);
+          if (parts.length >= 2 && parts[1] === String(pid)) return true;
+        }
+      }
+    }
     return false;
   }
 }
@@ -236,13 +263,14 @@ function lockOwnership(): LockOwnership {
     return "missing";
   }
   if (!/^[0-9]+$/.test(lockPid) || lockPid === "1") return "other";
+  const targetWinpid = msysToWinpid(lockPid) || lockPid;
   let pid = String(process.pid);
   for (let i = 0; i < 8; i += 1) {
-    if (pid === lockPid) return "owned";
+    if (pid === lockPid || pid === targetWinpid) return "owned";
     pid = parentPid(pid);
     if (!pid || pid === "1") break;
   }
-  return pidAlive(lockPid) ? "other" : "missing";
+  return (pidAlive(lockPid) || (targetWinpid !== lockPid && pidAlive(targetWinpid))) ? "other" : "missing";
 }
 
 function publishGenerationOwner(generation: SessionGeneration, phase: "active" | "handoff"): void {

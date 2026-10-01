@@ -805,7 +805,14 @@ fm_backend_herdr_presentation_lock_namespace_valid() {
   expected_uid=$(id -u 2>/dev/null) || return 1
   owner=$(fm_backend_herdr_presentation_lock_namespace_uid "$dir") || return 1
   mode=$(fm_backend_herdr_presentation_lock_namespace_mode "$dir") || return 1
-  [ "$owner" = "$expected_uid" ] && [ "$mode" = 700 ]
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*)
+      [ "$owner" = "$expected_uid" ]
+      ;;
+    *)
+      [ "$owner" = "$expected_uid" ] && [ "$mode" = 700 ]
+      ;;
+  esac
 }
 
 # Resolve the one verified running named-session socket path as an absolute
@@ -824,9 +831,10 @@ fm_backend_herdr_canonical_socket_path() {  # <socket-path>
   local socket=$1 sock_dir sock_base
   [ -n "$socket" ] || return 1
   case "$socket" in
-    /*) ;;
+    /*|[a-zA-Z]:*) ;;
     *) return 1 ;;
   esac
+  socket="${socket//\\//}"
   sock_dir=$(dirname "$socket")
   sock_base=$(basename "$socket")
   [ -n "$sock_dir" ] && [ -n "$sock_base" ] || return 1
@@ -840,7 +848,7 @@ fm_backend_herdr_canonical_socket_path() {  # <socket-path>
 fm_backend_herdr_presentation_session_socket_path() {  # <session>
   local session=$1 sessions socket
   [ -n "$session" ] || return 1
-  sessions=$(fm_backend_herdr_cli "$session" session list --json 2>/dev/null) || return 1
+  sessions=$(fm_backend_herdr_cli "$session" session list --json 2>/dev/null)
   socket=$(printf '%s' "$sessions" | jq -er --arg want "$session" '
     [.sessions[]?
       | select(.name == $want and .running == true)
@@ -848,7 +856,12 @@ fm_backend_herdr_presentation_session_socket_path() {  # <session>
       | select((.socket_path | length) > 0)
       | .socket_path]
     | if length == 1 then .[0] else empty end
-  ' 2>/dev/null) || return 1
+  ' 2>/dev/null)
+  if [ -z "$socket" ]; then
+    socket=$(fm_backend_herdr_cli "$session" status --json 2>/dev/null | jq -er '
+      .server.socket // empty
+    ' 2>/dev/null) || return 1
+  fi
   fm_backend_herdr_canonical_socket_path "$socket"
 }
 
@@ -868,7 +881,7 @@ fm_backend_herdr_presentation_session_lock_path() {  # <session>
   dir=$(fm_backend_herdr_presentation_lock_namespace) || return 1
   [ -n "$dir" ] || return 1
   if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
-    if ! mkdir -m 700 "$dir" 2>/dev/null; then
+    if ! mkdir -m 700 "$dir" 2>/dev/null && ! mkdir "$dir" 2>/dev/null; then
       fm_backend_herdr_presentation_lock_namespace_valid "$dir" || return 1
     fi
   fi
@@ -3030,8 +3043,26 @@ fm_backend_herdr_target_ready() {  # <target>
 # worktree subshell - confirmed live against a real treehouse acquisition.
 fm_backend_herdr_current_path() {  # <target>
   fm_backend_herdr_target_ready "$1" || return 0
-  fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane get "$FM_BACKEND_HERDR_PANE" 2>/dev/null \
-    | jq -r '.result.pane.foreground_cwd // empty' 2>/dev/null
+  local json path title
+  json=$(fm_backend_herdr_cli "$FM_BACKEND_HERDR_SESSION" pane get "$FM_BACKEND_HERDR_PANE" 2>/dev/null)
+  path=$(printf '%s' "$json" | jq -r '.result.pane.foreground_cwd // empty' 2>/dev/null)
+  if [ -z "$path" ]; then
+    title=$(printf '%s' "$json" | jq -r '.result.pane.terminal_title_stripped // .result.pane.terminal_title // empty' 2>/dev/null)
+    case "$title" in
+      *:/*|*:[a-zA-Z]:*)
+        path="${title#*:}"
+        ;;
+    esac
+  fi
+  if [ -z "$path" ]; then
+    path=$(printf '%s' "$json" | jq -r '.result.pane.cwd // empty' 2>/dev/null)
+  fi
+  [ -n "$path" ] || return 0
+  if command -v cygpath >/dev/null 2>&1; then
+    cygpath -u "$path" 2>/dev/null || printf '%s' "$path"
+  else
+    printf '%s' "$path"
+  fi
 }
 
 # fm_backend_herdr_send_text_line: send one line of TEXT then submit,

@@ -50,7 +50,13 @@ fm_pid_alive() {
   case "$pid" in
     ''|*[!0-9]*) return 1 ;;
   esac
-  kill -0 "$pid" 2>/dev/null
+  kill -0 "$pid" 2>/dev/null && return 0
+  case "${_FM_UNAME:-$(uname -s 2>/dev/null)}" in
+    MINGW*|MSYS*|CYGWIN*)
+      [ -x /bin/kill ] && /bin/kill -W -0 "$pid" 2>/dev/null && return 0
+      ;;
+  esac
+  return 1
 }
 
 fm_pid_identity() {
@@ -149,6 +155,14 @@ fm_watcher_lock_matches_pid() {
   lock_home=$(cat "$lockdir/fm-home" 2>/dev/null || true)
   lock_path=$(cat "$lockdir/watcher-path" 2>/dev/null || true)
   lock_identity=$(cat "$lockdir/pid-identity" 2>/dev/null || true)
+  case "${_FM_UNAME:-$(uname -s 2>/dev/null)}" in
+    MINGW*|MSYS*|CYGWIN*)
+      if command -v cygpath >/dev/null 2>&1; then
+        lock_home=$(cygpath -u "$lock_home" 2>/dev/null || printf '%s' "$lock_home")
+        home=$(cygpath -u "$home" 2>/dev/null || printf '%s' "$home")
+      fi
+      ;;
+  esac
   [ "$lock_home" = "$home" ] || return 1
   [ "$lock_path" = "$watch_path" ] || return 1
   [ -n "$lock_identity" ] || return 1
@@ -557,8 +571,19 @@ fm_lock_claim() {
 }
 
 fm_lock_try_create() {
-  local lockdir=$1 allowed_steal_owner=${2:-} ownerdir
+  local lockdir=$1 allowed_steal_owner=${2:-} ownerdir mypid
   FM_LOCK_OWNER_DIR=
+  case "${_FM_UNAME:-}" in
+    MINGW*|MSYS*|CYGWIN*)
+      if mkdir "$lockdir" 2>/dev/null; then
+        fm_current_pid mypid || { rmdir "$lockdir" 2>/dev/null; return 1; }
+        printf '%s\n' "$mypid" > "$lockdir/pid" 2>/dev/null
+        FM_LOCK_OWNER_DIR=$lockdir
+        return 0
+      fi
+      return 1
+      ;;
+  esac
   ownerdir=$(fm_lock_owner_dir "$lockdir") || return 1
   if [ -e "$lockdir" ] || [ -L "$lockdir" ]; then
     fm_lock_discard_owner "$ownerdir"

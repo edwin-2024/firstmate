@@ -4092,7 +4092,14 @@ if [ "$RELAUNCH" -eq 1 ]; then
   fi
   [ "$KIND" = secondmate ] || validate_spawn_worktree "relaunch" "$T"
 elif [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ]; then
-  spawn_send_text_line "$WT_TARGET" 'treehouse get'
+  case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*)
+      spawn_send_text_line "$WT_TARGET" 'export COMSPEC="C:\Program Files\Git\bin\bash.exe" && treehouse get'
+      ;;
+    *)
+      spawn_send_text_line "$WT_TARGET" 'treehouse get'
+      ;;
+  esac
 
   # Wait for the treehouse subshell: the pane's cwd moves from the project to the worktree.
   # Target the stable window id, not the name: if the name is ever lost (e.g. an
@@ -4659,6 +4666,26 @@ GIT_HOOKS_DIR="$STATE_REAL/$ID.git-hooks"
   echo "error: could not install the AI-trailer strip hooks for $ID" >&2
   exit 1
 }
+
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*|CYGWIN*)
+    if [ -d "$WT/.pi/extensions/lib" ]; then
+      for f in "$WT/.pi/extensions/lib"/*.ts; do
+        if [ -f "$f" ] && [ ! -L "$f" ]; then
+          symlink_target=$(head -n 1 "$f" 2>/dev/null || true)
+          case "$symlink_target" in
+            ../*)
+              abs_target=$(cd "$(dirname "$f")" && cd "$(dirname "$symlink_target")" 2>/dev/null && pwd -P)/$(basename "$symlink_target")
+              if [ -f "$abs_target" ]; then
+                cp -f "$abs_target" "$f"
+              fi
+              ;;
+          esac
+        fi
+      done
+    fi
+    ;;
+esac
 
 # Delivery posture recorded in meta so fm-teardown's safety check and the
 # validate/merge stages can branch on it. A ship task carries the explicit
