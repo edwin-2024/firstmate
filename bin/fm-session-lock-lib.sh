@@ -27,13 +27,13 @@ unset _FM_SESSION_LOCK_LIB_DIR
 # Known harness command names; extend when a new adapter is verified. omp is
 # anchored exactly like pi: its process name is the bare word `omp` (verified,
 # omp 18.1.11), and a substring match would claim ompd or comp.
-FM_HARNESS_RE='claude|codex|opencode|grok|kimi|^pi$|^pi-signed$|^omp$'
+FM_HARNESS_RE='claude|codex|opencode|grok|kimi|^pi$|^pi-signed$|^omp$|^agy$'
 
 # The same harnesses as exact executable names. Keep in sync with
 # FM_HARNESS_RE. Used only for the stricter path evidence below, where the
 # loose regex would also match ordinary firstmate paths such as
 # bin/fm-claude-stop-autoarm.sh.
-FM_HARNESS_NAMES=(claude codex opencode grok kimi pi-signed pi omp)
+FM_HARNESS_NAMES=(claude codex opencode grok kimi pi-signed pi omp agy)
 
 # Print the exact harness name carried by executable path $1 - its own basename
 # or any directory component - or return 1.
@@ -47,6 +47,7 @@ FM_HARNESS_NAMES=(claude codex opencode grok kimi pi-signed pi omp)
 fm_harness_path_name() {  # <path>
   local path=$1 name
   [ -n "$path" ] || return 1
+  path=${path//\\//}
   for name in "${FM_HARNESS_NAMES[@]}"; do
     case "/$path/" in
       */"$name"/*) printf '%s' "$name"; return 0 ;;
@@ -72,6 +73,7 @@ fm_harness_process_matches() {  # <comm> <args>
   local comm=$1 args=$2 base argv0 name
   FM_HARNESS_IS_CLAUDE=0
   base=$(basename -- "$comm")
+  base=${base%.[eE][xX][eE]}
   if printf '%s' "$base" | grep -qE "$FM_HARNESS_RE"; then
     case "$base" in *claude*) FM_HARNESS_IS_CLAUDE=1 ;; esac
     return 0
@@ -120,7 +122,7 @@ _fm_winpid_alive() {
   case "${_FM_UNAME:-$(uname -s 2>/dev/null)}" in
     MINGW*|MSYS*|CYGWIN*)
       if command -v tasklist.exe >/dev/null 2>&1; then
-        tasklist.exe //FI "PID eq $pid" //NH 2>/dev/null | grep -qE "^[a-zA-Z0-9_.-]+\.exe\s+$pid" && return 0
+        tasklist.exe //FI "PID eq $pid" //NH 2>/dev/null | grep -iqE "^[a-zA-Z0-9_.-]+\.exe\s+$pid" && return 0
       fi
       ;;
   esac
@@ -213,48 +215,81 @@ fm_harness_ancestry_pids() {
         fi
       fi
     done
-    if [ "$printed" -eq 0 ] && [ -r /proc/$$/winpid ] && command -v powershell.exe >/dev/null 2>&1; then
-      local winpid_list wpid
-      winpid_list=$(WINPID_VAL=$(cat /proc/$$/winpid 2>/dev/null) powershell.exe -NoProfile -Command '
-$cur = [int]$env:WINPID_VAL
-while ($cur -and $cur -ne 0) {
-  $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $cur"
-  if ($proc) {
-    if (($proc.Name -like "*node*" -and ($proc.CommandLine -like "*pi-coding-agent*" -or $proc.CommandLine -like "*pi-launcher*")) -or $proc.Name -like "*pi*") {
-      Write-Host $proc.ProcessId
-    }
-    $cur = $proc.ParentProcessId
-  } else {
-    break
+  fi
+  if [ "$printed" -eq 0 ] && [ -r "/proc/$$/winpid" ] && command -v powershell.exe >/dev/null 2>&1; then
+    # MSYS/Git Bash: the POSIX ancestry ends at the first Windows-native parent
+    # (pid 1), and the Windows process behind $$ can be a transient exec stub
+    # whose parent chain no longer reaches the harness. Start the Windows walk
+    # from every MSYS ancestor's winpid, innermost first, and accept the first
+    # chain that contains a verified harness.
+    local start_winpids='' mp=$$ w row chain_pid chain_name chain_cmd
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+      [ -r "/proc/$mp/winpid" ] || break
+      w=$(cat "/proc/$mp/winpid" 2>/dev/null)
+      case "$w" in '' | *[!0-9]*) ;; *) start_winpids="$start_winpids $w" ;; esac
+      mp=$(awk '{print $4}' "/proc/$mp/stat" 2>/dev/null)
+      case "$mp" in '' | *[!0-9]* | 0 | 1) break ;; esac
+    done
+    if [ -n "$start_winpids" ]; then
+      local win_rows
+      win_rows=$(FM_START_WINPIDS="$start_winpids" powershell.exe -NoProfile -NonInteractive -Command '
+$byId = @{}
+foreach ($p in Get-CimInstance Win32_Process) { $byId[[int]$p.ProcessId] = $p }
+foreach ($s in ($env:FM_START_WINPIDS -split "\s+")) {
+  if (-not $s) { continue }
+  $cur = [int]$s; $seen = @{}
+  for ($i = 0; $i -lt 32 -and $cur -gt 0 -and -not $seen.ContainsKey($cur); $i++) {
+    $seen[$cur] = 1
+    $p = $byId[$cur]
+    if (-not $p) { break }
+    $cmd = [string]$p.CommandLine -replace "[\t\r\n]", " "
+    Write-Output ("ROW`t{0}`t{1}`t{2}" -f $p.ProcessId, $p.Name, $cmd)
+    $cur = [int]$p.ParentProcessId
   }
-}' 2>/dev/null)
-      for wpid in $winpid_list; do
-        if [ -n "$wpid" ] && fm_harness_pid_alive "$wpid"; then
-          printf '%s\n' "$wpid"
+  Write-Output "END"
+}' 2>/dev/null | tr -d '\r')
+      extending=0
+      while IFS= read -r row; do
+        if [ "$row" = "END" ]; then
+          [ "$printed" -eq 1 ] && break
+          extending=0
+          continue
+        fi
+        [ "${row%%$'\t'*}" = "ROW" ] || continue
+        row=${row#ROW$'\t'}
+        chain_pid=${row%%$'\t'*}; row=${row#*$'\t'}
+        chain_name=${row%%$'\t'*}; chain_cmd=${row#*$'\t'}
+        if fm_harness_process_matches "$chain_name" "$chain_cmd"; then
+          printf '%s\n' "$chain_pid"
+          printed=1
+          [ "$FM_HARNESS_IS_CLAUDE" -eq 1 ] && { extending=1; continue; }
+          break
+        elif [ "$extending" -eq 1 ]; then
+          break
+        fi
+      done <<EOF
+$win_rows
+EOF
+    fi
+  fi
+  if [ "$printed" -eq 0 ] && ([ -n "${PI_SESSION_FILE:-}" ] || [ -n "${PI_SESSION_ID:-}" ]); then
+    local want_id="${PI_SESSION_ID:-}"
+    for p in /proc/[0-9]*; do
+      local check_pid=${p#/proc/}
+      local check_cmd
+      check_cmd=$(cat "$p/cmdline" 2>/dev/null | tr '\0' ' ')
+      if [[ "$check_cmd" == *"pi-coding-agent"* ]]; then
+        local ret_pid=$check_pid
+        if [ -r "$p/winpid" ]; then
+          ret_pid=$(cat "$p/winpid" 2>/dev/null)
+        fi
+        if [ -z "$want_id" ] || [[ "$check_cmd" == *"$want_id"* ]] || fm_harness_pid_alive "$ret_pid"; then
+          printf '%s\n' "$ret_pid"
           printed=1
           break
         fi
-      done
-    fi
-    if [ "$printed" -eq 0 ]; then
-      local want_id="${PI_SESSION_ID:-}"
-      for p in /proc/[0-9]*; do
-        local check_pid=${p#/proc/}
-        local check_cmd
-        check_cmd=$(cat "$p/cmdline" 2>/dev/null | tr '\0' ' ')
-        if [[ "$check_cmd" == *"pi-coding-agent"* ]]; then
-          local ret_pid=$check_pid
-          if [ -r "$p/winpid" ]; then
-            ret_pid=$(cat "$p/winpid" 2>/dev/null)
-          fi
-          if [ -z "$want_id" ] || [[ "$check_cmd" == *"$want_id"* ]] || fm_harness_pid_alive "$ret_pid"; then
-            printf '%s\n' "$ret_pid"
-            printed=1
-            break
-          fi
-        fi
-      done
-    fi
+      fi
+    done
   fi
   [ "$printed" -eq 1 ]
 }

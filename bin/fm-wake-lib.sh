@@ -540,6 +540,11 @@ fm_lock_link_owner() {
 
 fm_lock_points_to_owner() {
   local lockdir=$1 ownerdir=$2 actual
+  case "${_FM_UNAME:-}" in
+    MINGW*|MSYS*|CYGWIN*)
+      [ -d "$lockdir" ] && [ "$lockdir" = "$ownerdir" ] && return 0
+      ;;
+  esac
   actual=$(readlink "$lockdir" 2>/dev/null) || return 1
   [ "$actual" = "$ownerdir" ]
 }
