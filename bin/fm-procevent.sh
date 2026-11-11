@@ -943,11 +943,25 @@ isolate_runner() {  # <wait|detach> <source-id>
   isolate_process "$1" "$SCRIPT_DIR/fm-procevent.sh" _start "$2"
 }
 
+inspect_pgid() {  # <pid>
+  local pid=$1 out
+  out=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'my $pg = getpgrp(shift); print $pg if defined $pg' "$pid" 2>/dev/null
+    return 0
+  fi
+  return 1
+}
+
 require_isolated_group() {  # <role>
   local role=$1 pgid
   [ "${FM_PROCEVENT_RUNNER_GROUP:-}" = "$$" ] \
     || die "$role process group was not isolated"
-  pgid=$(ps -o pgid= -p "$$" 2>/dev/null | tr -d '[:space:]') \
+  pgid=$(inspect_pgid "$$") \
     || die "cannot inspect $role process group"
   [ -n "$pgid" ] || die "cannot inspect $role process group"
   [ "$pgid" = "$$" ] || die "$role does not lead its process group"
@@ -2023,7 +2037,7 @@ runner_group_signal() {  # <signal> <pid> <identity> [proved]
       1) fm_procevent_group_alive "$pid" && return 2; return 1 ;;
       *) return 2 ;;
     esac
-    pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]') || return 2
+    pgid=$(inspect_pgid "$pid") || return 2
     [ "$pgid" = "$pid" ] || return 2
   fi
   # KNOWN LIMIT: portable shell cannot make this verification and signal atomic,
